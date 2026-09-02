@@ -29,8 +29,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.Objects;
 import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
 
@@ -65,11 +67,20 @@ final class TraceSourceSanitizer {
     /**
      * Rewrites {@code trace.stacks} inside the given trace archive in place, if present.
      *
+     * <p>If the archive has no {@code trace.stacks} entry at all — which is what actually happens when
+     * {@code PLAYWRIGHT_JAVA_SRC} was never configured for this session, since Playwright's Java client
+     * doesn't collect a stack per call at all in that case — there's nothing to sanitize. Checking for the
+     * entry up front (an O(1) central-directory lookup) skips the full unzip/rewrite of a potentially large
+     * archive (screenshots, snapshots, network capture) in that, likely common, case.</p>
+     *
      * @param trace path to a Playwright trace zip, as produced by {@code Tracing.stop()}.
      */
     static void sanitize(final Path trace) {
         Path rewritten = null;
         try {
+            if (!hasStacksEntry(trace)) {
+                return;
+            }
             rewritten = Files.createTempFile("allure-playwright-trace-sanitized-", ".zip");
             if (rewrite(trace, rewritten)) {
                 Files.move(rewritten, trace, StandardCopyOption.REPLACE_EXISTING);
@@ -78,7 +89,13 @@ final class TraceSourceSanitizer {
         } catch (IOException | RuntimeException e) {
             LOGGER.warn("Could not sanitize Playwright trace sources, attaching the trace unchanged", e);
         } finally {
-            delete(rewritten);
+            deleteIfExists(rewritten);
+        }
+    }
+
+    private static boolean hasStacksEntry(final Path trace) throws IOException {
+        try (ZipFile zip = new ZipFile(trace.toFile())) {
+            return zip.getEntry(STACKS_ENTRY) != null;
         }
     }
 
@@ -140,16 +157,26 @@ final class TraceSourceSanitizer {
      * nothing left after it, leave the stack untouched instead of trimming it down to nothing.</p>
      */
     private static int firstUsableFrameIndex(final JsonArray files, final JsonArray frames) {
+        int resolvedAt = -1;
+        int syntheticRun = 0;
+        boolean inLeadingRun = true;
         for (int i = 0; i < frames.size(); i++) {
-            if (isFileResolved(files, frames.get(i).getAsJsonArray())) {
-                return i;
+            final JsonArray frame = frames.get(i).getAsJsonArray();
+            if (resolvedAt < 0 && isFileResolved(files, frame)) {
+                resolvedAt = i;
+            }
+            if (inLeadingRun) {
+                if (isSyntheticFrame(frame)) {
+                    syntheticRun = i + 1;
+                } else {
+                    inLeadingRun = false;
+                }
             }
         }
-        int i = 0;
-        while (i < frames.size() && isSyntheticFrame(frames.get(i).getAsJsonArray())) {
-            i++;
+        if (resolvedAt >= 0) {
+            return resolvedAt;
         }
-        return i < frames.size() ? i : 0;
+        return syntheticRun < frames.size() ? syntheticRun : 0;
     }
 
     private static boolean isFileResolved(final JsonArray files, final JsonArray frame) {
@@ -181,14 +208,14 @@ final class TraceSourceSanitizer {
         return buffer.toByteArray();
     }
 
-    private static void delete(final Path path) {
-        if (path == null) {
+    private static void deleteIfExists(final Path file) {
+        if (Objects.isNull(file)) {
             return;
         }
         try {
-            Files.deleteIfExists(path);
+            Files.deleteIfExists(file);
         } catch (IOException e) {
-            LOGGER.debug("Could not delete temporary file {}", path, e);
+            LOGGER.warn("Could not delete temporary file {}", file, e);
         }
     }
 }

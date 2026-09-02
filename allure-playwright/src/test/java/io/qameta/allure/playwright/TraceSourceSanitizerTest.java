@@ -38,6 +38,7 @@ import java.nio.file.Path;
 import java.util.Collections;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
+import java.util.zip.ZipOutputStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -165,6 +166,37 @@ class TraceSourceSanitizerTest {
         TraceSourceSanitizer.sanitize(notAZip);
 
         assertThat(Files.readAllBytes(notAZip)).isEqualTo(original);
+    }
+
+    /**
+     * Checks that a valid trace with no {@code trace.stacks} entry at all — what actually happens when
+     * {@code PLAYWRIGHT_JAVA_SRC} was never configured, since Playwright's client then never collects a stack
+     * per call — is left completely, byte-for-byte untouched, without paying for a full unzip/rewrite.
+     *
+     * <p>Byte-for-byte, not just functionally equivalent, is the point of this test: a full rewrite through
+     * {@code ZipOutputStream} would re-derive entry metadata and almost certainly not reproduce the original
+     * bytes exactly, so this also guards against the short-circuit in
+     * {@link TraceSourceSanitizer#sanitize(Path)} silently regressing back into always rewriting.</p>
+     *
+     * @param tempDir a directory managed by JUnit for this test's temporary file.
+     */
+    @Test
+    void shouldLeaveTraceUntouchedWhenNoStacksEntry(@TempDir final Path tempDir) throws IOException {
+        final Path trace = tempDir.resolve("trace.zip");
+        writeZip(trace, "trace.trace", "{\"type\":\"context-options\"}".getBytes(StandardCharsets.UTF_8));
+        final byte[] original = Files.readAllBytes(trace);
+
+        TraceSourceSanitizer.sanitize(trace);
+
+        assertThat(Files.readAllBytes(trace)).isEqualTo(original);
+    }
+
+    private static void writeZip(final Path zip, final String entryName, final byte[] content) throws IOException {
+        try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(zip))) {
+            zos.putNextEntry(new ZipEntry(entryName));
+            zos.write(content);
+            zos.closeEntry();
+        }
     }
 
     /**
