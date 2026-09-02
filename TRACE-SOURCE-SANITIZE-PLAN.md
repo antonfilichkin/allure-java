@@ -1,12 +1,14 @@
 # Sanitize AspectJ-shadowed source frames in Playwright traces
 
-**Status:** draft implementation guide, not yet started. Written from `aurora-light` (a downstream
-consumer of `allure-playwright`), where this exact fix was implemented, verified against a real trace, and
-confirmed working live in Trace Viewer. This doc ports that proven fix into `allure-playwright` itself so
-every consumer gets it, not just one project's local workaround.
+**Status:** implemented on `feat/playwright-trace-sources-flag` (`TraceSourceSanitizer`, wired into
+`DefaultTraceSession.stop()`, gated by `allure.playwright.trace.sanitize-sources`). Not yet merged or in a PR.
+Written from `aurora-light` (a downstream consumer of `allure-playwright`), where this exact fix was first
+implemented, verified against a real trace, and confirmed working live in Trace Viewer; the rest of this doc
+is the original design write-up, kept as-is below except where a correction is called out inline — see the
+"Concrete before/after example" and "Relationship to other changes" sections for what actually shipped and
+how it differs from the original sketch.
 
-Per `AGENTS.md`: **no PR or branch push without explicit user confirmation.** This file is a plan to review
-first.
+Per `AGENTS.md`: **no PR or branch push without explicit user confirmation.**
 
 ## Problem
 
@@ -78,8 +80,8 @@ Trace Viewer's Source tab reads frame **0** as *the* location for this action �
 resolves to nothing useful. The real call site is sitting right there at frame 10, untouched, just buried under
 nine frames of AspectJ/Playwright-`_aroundBody`/`$AjcClosure` glue.
 
-**After** — same stack, trimmed by the proposed heuristic (first frame that is either file-resolvable or
-immediately follows a run of denylisted synthetic frames):
+**After** — same stack, trimmed by the actual implemented algorithm (`TraceSourceSanitizer`, since built —
+see below): scan the *whole* stack for the first frame anywhere that's file-resolvable, and cut there:
 
 ```
 0  io.qameta.allure.playwright.ScratchTraceCapture.captureTrace   ScratchTraceCapture.java:34   <- real caller
@@ -92,14 +94,41 @@ resolvable file and line to show. This matches the plan's evidence from `aurora-
 `JoinPointImpl.proceed`-at-frame-0 pattern, same fix), just reproduced with this module's own test harness
 instead of a downstream consumer's.
 
-One nuance worth noting for the belt-and-suspenders denylist (see "Design differences" below): frames 2 and 9
-here (`PageImpl.click` / `Page.click`) are real `com.microsoft.playwright` classes, not AspectJ-generated ones —
-they don't match the denylist patterns and wouldn't be skipped by rule (2) alone. In this capture they were
-still trimmed correctly because rule (1), the file-presence heuristic, already resolves frame 10 as the first
-usable frame (Playwright's own impl classes have no entry in `files[]` since `PLAYWRIGHT_JAVA_SRC` only pointed
-at this module's test sources). The denylist is genuinely a belt-and-suspenders backstop for when file
-resolution *doesn't* land past every synthetic frame on its own — it is not sufficient by itself to skip
-Playwright's own internal frames.
+**Correction to the original algorithm sketch above:** frames 2 and 9 here (`PageImpl.click` / `Page.click`)
+are real `com.microsoft.playwright` classes, not AspectJ-generated ones — they don't match the
+synthetic-frame denylist. A per-frame "first frame that's either file-resolvable *or not on the denylist*"
+scan (what was originally written above) stops dead at frame 2, since it's non-synthetic — it never reaches
+frame 10 at all. The implementation that actually shipped fixes this: the file-resolution signal scans the
+**entire** stack first and is authoritative wherever it fires, regardless of what non-file-resolved,
+non-denylisted frames sit in between (frame 10 wins even though frames 2 and 9 are in the way). The denylist
+is only consulted as a backstop, and only when *no* frame anywhere in the stack resolves a file at all — in
+that case, the leading run of denylist-matching frames from frame 0 is trimmed instead (and if that run
+reaches the end of the stack with nothing real after it, the stack is left alone rather than emptied).
+
+**Untrimmed example, same repo, same run:** not every recorded call goes through the aspect at all —
+`AllurePlaywrightAspect`'s pointcut only advises `Page`/`Frame`/`Locator`/`ElementHandle`/assertion methods, not
+`BrowserContext`/`Tracing`. The very same capture's `context.tracing().start(...)` call (a `Tracing` method) has
+no synthetic frame in front of it to begin with:
+
+```
+0  io.qameta.allure.playwright.ScratchTraceCapture2.captureTrace   ScratchTraceCapture2.java:26   <- real caller
+1  jdk.internal.reflect.DirectMethodHandleAccessor.invoke
+    ... (unchanged from here down)
+```
+
+`TraceSourceSanitizer` leaves this one alone: frame 0 already resolves (`isFileResolved` is true at `i == 0`),
+so the cut index is `0` and nothing gets trimmed — exactly the "don't touch what's already fine" case the unit
+tests (`shouldLeaveAlreadyResolvedStackUnchanged`, `shouldLeaveNonSyntheticStackUnchanged`) exercise directly.
+
+**Also implemented, not just a nuance:** `TraceSourceSanitizer.sanitize()` checks for a `trace.stacks` entry
+before doing any unzip/rewrite at all. Without `PLAYWRIGHT_JAVA_SRC` configured *anywhere* (not per-frame —
+at all), Playwright's Java client never collects a stack per call in the first place (confirmed by decompiling
+`com.microsoft.playwright.impl.StackTraceCollector.createFromEnv`: it returns `null`, and nothing downstream
+ever calls `currentStackTrace()`, when the env var resolves to `null`), so the entry is simply absent and
+there's nothing to sanitize — checking `System.getenv("PLAYWRIGHT_JAVA_SRC")` directly from
+`allure-playwright`'s own process was considered and rejected, since a consumer can also set it via
+`Playwright.CreateOptions().setEnv(...)` (as this repo's own end-to-end test does), which never touches the
+real OS environment our code would be checking.
 
 ## Where this belongs in `allure-playwright`
 
@@ -204,16 +233,26 @@ this feature).
 - `.setSources(true)` on `AllurePlaywright.startTracing()`'s default `Tracing.StartOptions` is no longer this
   fork's own uncommitted change — it landed unconditionally from `upstream/main` itself (pulled in via the
   `main` fast-forward to `c588b137`).
-- That unconditional `setSources(true)` has since been made configurable (branch
-  `feat/playwright-trace-sources-flag`, not yet pushed): a new `allure.playwright.trace.sources` property
-  (default `true`, preserving current behavior) gates the option, and the resolved boolean is threaded into
-  `DefaultTraceSession` so this sanitization step, whenever it's built, can gate on the same per-session value
-  the plan already calls for below ("Gate behind the existing `sources` flag, not a new config property") —
-  the flag exists now, `TraceSourceSanitizer` itself does not yet.
+- That unconditional `setSources(true)` has since been made configurable on `feat/playwright-trace-sources-flag`
+  (pushed to `origin`): `allure.playwright.trace.sources` (default `false` — opt-in, not opt-out; flipped from
+  this doc's original `true` suggestion) gates the option, and the resolved boolean is threaded into
+  `DefaultTraceSession` for the sanitizer below to use.
+- `TraceSourceSanitizer` itself is now built on the same branch — see "Concrete before/after example" above for
+  what it actually does and how the shipped algorithm differs from this doc's original per-frame sketch. Also
+  implemented: `allure.playwright.trace.sanitize-sources` (default `true`) as the opt-out this doc's
+  "Implementation steps" section called for, and the `trace.stacks`-existence short-circuit described above.
+  Uses Gson (`compileOnly`) rather than either option this doc originally weighed (a new direct Jackson
+  dependency, or a hand-rolled parser) — `com.microsoft.playwright:playwright` already requires Gson at compile
+  scope in its own POM, so any real consumer already has it on their classpath at zero added cost.
+- Test coverage landed alongside it: `TraceSourceSanitizerTest`, covering the pure JSON transform (trimmed,
+  untrimmed, multi-stack, fail-open-on-invalid-zip, skip-when-no-stacks-entry cases) plus one end-to-end test
+  that captures a real trace via its own `Playwright` instance with `PLAYWRIGHT_JAVA_SRC` set through
+  `Playwright.CreateOptions().setEnv(...)`, sanitizes it, and asserts frame 0 resolves to the real caller —
+  matching the "Testing / verification" section below.
 
 This sanitization fix is a natural next piece of the same story — embedding source only helps if the frame
 Trace Viewer reads is trustworthy, and right now (per the reproduction above) it isn't for any consumer
 running the aspect (i.e. almost everyone, since `steps.enabled` defaults to `true`). Consider whether to land
-this as its own PR referencing `feat/playwright-trace-sources-flag`, or squashed together — separate is
-probably easier to review given they touch different concerns (config surface vs. trace-content rewriting),
-but say so explicitly in the PR description either way.
+this as its own PR, or split further along the boundary already reflected in the two commits on
+`feat/playwright-trace-sources-flag` (the config flag, then the sanitizer) — either way, still not opened as a
+PR pending your go-ahead per `AGENTS.md`.
