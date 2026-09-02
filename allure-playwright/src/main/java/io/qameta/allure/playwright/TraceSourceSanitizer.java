@@ -31,6 +31,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Objects;
 import java.util.regex.Pattern;
+import java.util.zip.CRC32;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
@@ -53,6 +54,13 @@ final class TraceSourceSanitizer {
     private static final Logger LOGGER = LoggerFactory.getLogger(TraceSourceSanitizer.class);
 
     private static final String STACKS_ENTRY = "trace.stacks";
+
+    // Playwright puts screenshots/snapshots/embedded-source blobs here. They're already
+    // compressed-or-incompressible (JPEG/PNG, mostly), so re-DEFLATE-ing them on the way through buys
+    // nothing but CPU time - store them as-is instead. This is the dominant cost of a full trace rewrite:
+    // benchmarked at ~25-45ms for a ~400KB trace up to ~80ms for a ~3.4MB one, scaling with archive size,
+    // not with the number of recorded stacks (500 vs. 50 stacks made no measurable difference).
+    private static final String RESOURCES_PREFIX = "resources/";
 
     private static final Pattern SYNTHETIC_FRAME = Pattern.compile(
             "^org\\.aspectj\\.runtime\\.reflect\\.JoinPointImpl\\."
@@ -99,25 +107,40 @@ final class TraceSourceSanitizer {
         }
     }
 
-    @SuppressWarnings("PMD.AvoidInstantiatingObjectsInLoops")
     private static boolean rewrite(final Path trace, final Path rewritten) throws IOException {
         boolean stacksFound = false;
         try (ZipInputStream zis = new ZipInputStream(Files.newInputStream(trace));
                 ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(rewritten))) {
             ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
+                final String name = entry.getName();
                 final byte[] content = readAll(zis);
-                zos.putNextEntry(new ZipEntry(entry.getName()));
-                if (STACKS_ENTRY.equals(entry.getName())) {
+                if (STACKS_ENTRY.equals(name)) {
                     stacksFound = true;
-                    zos.write(sanitizeStacksJson(content));
+                    writeEntry(zos, name, sanitizeStacksJson(content), false);
                 } else {
-                    zos.write(content);
+                    writeEntry(zos, name, content, name.startsWith(RESOURCES_PREFIX));
                 }
-                zos.closeEntry();
             }
         }
         return stacksFound;
+    }
+
+    private static void writeEntry(final ZipOutputStream zos, final String name, final byte[] content,
+                                   final boolean stored)
+            throws IOException {
+        final ZipEntry outEntry = new ZipEntry(name);
+        if (stored) {
+            final CRC32 crc = new CRC32();
+            crc.update(content);
+            outEntry.setMethod(ZipEntry.STORED);
+            outEntry.setSize(content.length);
+            outEntry.setCompressedSize(content.length);
+            outEntry.setCrc(crc.getValue());
+        }
+        zos.putNextEntry(outEntry);
+        zos.write(content);
+        zos.closeEntry();
     }
 
     /**

@@ -36,6 +36,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
+import java.util.Random;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipOutputStream;
@@ -189,6 +190,42 @@ class TraceSourceSanitizerTest {
         TraceSourceSanitizer.sanitize(trace);
 
         assertThat(Files.readAllBytes(trace)).isEqualTo(original);
+    }
+
+    /**
+     * Checks that {@code resources/} entries (screenshots, snapshots — already-compressed-or-incompressible
+     * binary blobs) are stored rather than re-compressed when a trace does get rewritten: content must round
+     * trip exactly, and the entry should come out {@link ZipEntry#STORED} rather than
+     * {@link ZipEntry#DEFLATED}, since re-deflating such content buys nothing but CPU time.
+     *
+     * @param tempDir a directory managed by JUnit for this test's temporary file.
+     */
+    @Test
+    void shouldStoreResourceEntriesRatherThanRecompressThem(@TempDir final Path tempDir) throws IOException {
+        final Path trace = tempDir.resolve("trace.zip");
+        final byte[] screenshot = new byte[4096];
+        new Random(42).nextBytes(screenshot);
+        try (ZipOutputStream zos = new ZipOutputStream(Files.newOutputStream(trace))) {
+            zos.putNextEntry(new ZipEntry("resources/page@abc.jpeg"));
+            zos.write(screenshot);
+            zos.closeEntry();
+            zos.putNextEntry(new ZipEntry("trace.stacks"));
+            zos.write(
+                    ("{\"files\":[\"\"],\"stacks\":[[1,[[0,1,0,\"com.example.Caller.run\"]]]]}")
+                            .getBytes(StandardCharsets.UTF_8)
+            );
+            zos.closeEntry();
+        }
+
+        TraceSourceSanitizer.sanitize(trace);
+
+        try (ZipFile zip = new ZipFile(trace.toFile())) {
+            ZipEntry resourceEntry = zip.getEntry("resources/page@abc.jpeg");
+            assertThat(resourceEntry.getMethod()).isEqualTo(ZipEntry.STORED);
+            try (InputStream in = zip.getInputStream(resourceEntry)) {
+                assertThat(in.readAllBytes()).isEqualTo(screenshot);
+            }
+        }
     }
 
     private static void writeZip(final Path zip, final String entryName, final byte[] content) throws IOException {
