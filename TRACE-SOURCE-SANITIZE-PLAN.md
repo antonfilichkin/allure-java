@@ -47,6 +47,60 @@ Confirmed empirically (not theoretical) against real traces from `aurora-light`,
   rendering wants a non-zero column to draw its marker, that's a pre-existing Java-client limitation,
   unrelated to and not addressed by this fix.
 
+## Concrete before/after example, captured from this repo
+
+Not just `aurora-light` evidence — reproduced directly against this module's own test fixture (a temporary probe
+built on the same page/context setup as `AllurePlaywrightTest`, with `PLAYWRIGHT_JAVA_SRC` pointed at
+`allure-playwright/src/test/java`, then deleted; not part of the committed suite). `context.tracing().start()`
+with `setSources(true)`, then `page.setContent("<button>Trace</button>"); page.click("button");` under the same
+`-javaagent:aspectjweaver` weaving this module's tests already run with.
+
+**Before** — raw `trace.stacks` entry for the `click("button")` call (frame `file`/`line` shown only where
+`files[]` resolved a path):
+
+```
+0  org.aspectj.runtime.reflect.JoinPointImpl.proceed                                                    (no file)
+1  io.qameta.allure.playwright.AllurePlaywrightAspect.logPlaywrightStep                                 (no file)
+2  com.microsoft.playwright.impl.PageImpl.click                                                         (no file)
+3  com.microsoft.playwright.Page.click_aroundBody6                                                      (no file)
+4  com.microsoft.playwright.Page$AjcClosure7.run                                                        (no file)
+5  org.aspectj.runtime.reflect.JoinPointImpl.proceed                                                    (no file)
+6  io.qameta.allure.playwright.AllurePlaywrightAspect.runStep                                           (no file)
+7  io.qameta.allure.playwright.AllurePlaywrightAspect.ajc$inlineAccessMethod$...$runStep                (no file)
+8  io.qameta.allure.playwright.AllurePlaywrightAspect.logPlaywrightStep                                 (no file)
+9  com.microsoft.playwright.Page.click                                                                  (no file)
+10 io.qameta.allure.playwright.ScratchTraceCapture.captureTrace   ScratchTraceCapture.java:34   <- real caller
+11 jdk.internal.reflect.DirectMethodHandleAccessor.invoke                                               (no file)
+    ... (JUnit/ForkJoinPool plumbing continues below)
+```
+
+Trace Viewer's Source tab reads frame **0** as *the* location for this action — `JoinPointImpl.proceed`, which
+resolves to nothing useful. The real call site is sitting right there at frame 10, untouched, just buried under
+nine frames of AspectJ/Playwright-`_aroundBody`/`$AjcClosure` glue.
+
+**After** — same stack, trimmed by the proposed heuristic (first frame that is either file-resolvable or
+immediately follows a run of denylisted synthetic frames):
+
+```
+0  io.qameta.allure.playwright.ScratchTraceCapture.captureTrace   ScratchTraceCapture.java:34   <- real caller
+1  jdk.internal.reflect.DirectMethodHandleAccessor.invoke
+    ... (unchanged from here down)
+```
+
+Frames 0-9 are dropped; frame 10 becomes the new frame 0, and Trace Viewer's Source tab now has a real,
+resolvable file and line to show. This matches the plan's evidence from `aurora-light` almost exactly (same
+`JoinPointImpl.proceed`-at-frame-0 pattern, same fix), just reproduced with this module's own test harness
+instead of a downstream consumer's.
+
+One nuance worth noting for the belt-and-suspenders denylist (see "Design differences" below): frames 2 and 9
+here (`PageImpl.click` / `Page.click`) are real `com.microsoft.playwright` classes, not AspectJ-generated ones —
+they don't match the denylist patterns and wouldn't be skipped by rule (2) alone. In this capture they were
+still trimmed correctly because rule (1), the file-presence heuristic, already resolves frame 10 as the first
+usable frame (Playwright's own impl classes have no entry in `files[]` since `PLAYWRIGHT_JAVA_SRC` only pointed
+at this module's test sources). The denylist is genuinely a belt-and-suspenders backstop for when file
+resolution *doesn't* land past every synthetic frame on its own — it is not sufficient by itself to skip
+Playwright's own internal frames.
+
 ## Where this belongs in `allure-playwright`
 
 The equivalent of `aurora-light`'s workaround (`PlaywrightTraceSourcesLifecycle` — a whole custom
@@ -143,18 +197,23 @@ this feature).
   (`:allure-playwright:spotlessCheck checkstyleMain pmdMain spotbugsMain`, or the aggregate command if this
   touches shared build logic) and fix or `spotlessApply` as needed.
 
-## Relationship to the two changes already in this fork
+## Relationship to other changes around this feature (updated as of this fork's current state)
 
-This fork already has (see `git log`/`git diff`):
-- `0e414c33` — `AllurePlaywright.attachTrace()` content-type fix (`application/vnd.allure.playwright-trace`
-  instead of generic `application/zip`), landed as a commit.
-- an uncommitted change adding `.setSources(true)` to `AllurePlaywright.startTracing()`'s own default
-  `Tracing.StartOptions` (currently only sets `screenshots`/`snapshots`).
+- `0e414c33` (branch `fix/playwright-trace-content-type`) — `AllurePlaywright.attachTrace()` content-type fix
+  (`application/vnd.allure.playwright-trace` instead of generic `application/zip`), landed as a commit.
+- `.setSources(true)` on `AllurePlaywright.startTracing()`'s default `Tracing.StartOptions` is no longer this
+  fork's own uncommitted change — it landed unconditionally from `upstream/main` itself (pulled in via the
+  `main` fast-forward to `c588b137`).
+- That unconditional `setSources(true)` has since been made configurable (branch
+  `feat/playwright-trace-sources-flag`, not yet pushed): a new `allure.playwright.trace.sources` property
+  (default `true`, preserving current behavior) gates the option, and the resolved boolean is threaded into
+  `DefaultTraceSession` so this sanitization step, whenever it's built, can gate on the same per-session value
+  the plan already calls for below ("Gate behind the existing `sources` flag, not a new config property") —
+  the flag exists now, `TraceSourceSanitizer` itself does not yet.
 
-This sanitization fix is a natural third piece of the same story — the `setSources(true)` change makes the
-library actually try to embed source; without this fix, that embedded source is mostly useless for any
-consumer running the aspect (i.e. almost everyone, since `steps.enabled` defaults to `true`). Consider
-whether to land these as one coherent PR ("make embedded trace sources actually usable") or as separate,
-independently-reviewable PRs referencing each other — separate is probably easier to review given they
-touch different files/concerns, but say so explicitly in each PR description so reviewers see the full
-picture.
+This sanitization fix is a natural next piece of the same story — embedding source only helps if the frame
+Trace Viewer reads is trustworthy, and right now (per the reproduction above) it isn't for any consumer
+running the aspect (i.e. almost everyone, since `steps.enabled` defaults to `true`). Consider whether to land
+this as its own PR referencing `feat/playwright-trace-sources-flag`, or squashed together — separate is
+probably easier to review given they touch different concerns (config surface vs. trace-content rewriting),
+but say so explicitly in the PR description either way.
