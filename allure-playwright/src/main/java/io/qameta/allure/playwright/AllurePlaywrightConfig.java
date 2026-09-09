@@ -31,6 +31,8 @@ final class AllurePlaywrightConfig {
     static final String CLOSE_TRACE = "allure.playwright.close.trace";
     static final String CLOSE_VIDEO = "allure.playwright.close.video";
     static final String CLOSE_PAGE_LOGS = "allure.playwright.close.page-logs";
+    static final String TRACE_SOURCES = "allure.playwright.trace.sources";
+    static final String SANITIZE_TRACE_SOURCES = "allure.playwright.trace.sanitize-sources";
 
     private static final String ACTIONS = "actions";
     private static final String ALL = "all";
@@ -77,6 +79,14 @@ final class AllurePlaywrightConfig {
 
     static boolean shouldAttachClosePageLogs() {
         return getBoolean(CLOSE_PAGE_LOGS, true);
+    }
+
+    static boolean shouldEmbedTraceSources() {
+        return getBoolean(TRACE_SOURCES, false);
+    }
+
+    static boolean shouldSanitizeTraceSources() {
+        return getBoolean(SANITIZE_TRACE_SOURCES, true);
     }
 
     private static boolean getBoolean(final String key, final boolean defaultValue) {
